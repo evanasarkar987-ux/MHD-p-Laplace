@@ -1,0 +1,332 @@
+from mpi4py import MPI
+import numpy as np
+import ufl
+from basix.ufl import element, mixed_element
+from dolfinx import fem, mesh
+from dolfinx.fem.petsc import NonlinearProblem
+
+
+def g_np(s):
+    return s**3 * (1.0 - s)**3
+
+
+def gp_np(s):
+    return 3.0 * s**2 * (1.0 - s)**3 - 3.0 * s**3 * (1.0 - s)**2
+
+
+def exact_vec_numpy(t):
+    et = np.exp(-t)
+
+    def value(x):
+        gx = g_np(x[0])
+        gy = g_np(x[1])
+        gz = g_np(x[2])
+        gpx = gp_np(x[0])
+        gpy = gp_np(x[1])
+
+        return np.vstack((
+            et * gx * gpy * gz,
+            -et * gpx * gy * gz,
+            np.zeros_like(x[2]),
+        ))
+
+    return value
+
+
+def zero_pressure_numpy(t):
+    def value(x):
+        return np.zeros_like(x[0])
+
+    return value
+
+
+def solve_problem(n, dt_value):
+    T = 1.0
+
+    domain = mesh.create_unit_cube(
+        MPI.COMM_WORLD,
+        n,
+        n,
+        n,
+        cell_type=mesh.CellType.tetrahedron,
+    )
+
+    h =  np.sqrt(3.0) / n
+
+    cell = domain.basix_cell()
+    gdim = domain.geometry.dim
+
+    B_element = element("Nedelec 1st kind H(curl)", cell, 2)
+    u_element = element("Lagrange", cell, 2, shape=(gdim,))
+    p_element = element("Lagrange", cell, 1)
+
+    W = fem.functionspace(domain, mixed_element([B_element, u_element, p_element]))
+
+    w = fem.Function(W)
+    w_old = fem.Function(W)
+
+    B, u, p = ufl.split(w)
+    B_old, u_old, p_old = ufl.split(w_old)
+    C, v, q = ufl.TestFunctions(W)
+
+    time = fem.Constant(domain, 0.0)
+    dt = fem.Constant(domain, 1.0)
+    nu = fem.Constant(domain, 1.0)
+    zero = fem.Constant(domain, 0.0)
+
+    x = ufl.SpatialCoordinate(domain)
+    p_value = 2
+    eps = fem.Constant(domain, 1.0e-8)
+    dx = ufl.Measure("dx", domain=domain)
+
+
+    g0 = x[0]**3 * (1.0 - x[0])**3
+    g1 = x[1]**3 * (1.0 - x[1])**3
+    g2 = x[2]**3 * (1.0 - x[2])**3
+
+    psi = ufl.exp(-time) * g0 * g1 * g2
+
+    u_exact = ufl.as_vector((
+        psi.dx(1),
+        -psi.dx(0),
+        zero,
+    ))
+
+    B_exact = ufl.as_vector((
+        psi.dx(1),
+        -psi.dx(0),
+        zero,
+    ))
+
+    p_exact = zero
+
+    u_t_exact = -u_exact
+    B_t_exact = -B_exact
+    grad_exact = ufl.grad(u_exact)
+    grad_exact_norm = ufl.sqrt(ufl.inner(grad_exact, grad_exact) + eps)
+    grad_u = ufl.grad(u)
+    grad_u_norm = ufl.sqrt(ufl.inner(grad_u, grad_u) + eps)
+    F_current = (
+        ufl.inner((B - B_old) / dt, C) * ufl.dx
+        + ufl.inner(ufl.curl(B), ufl.curl(C)) * ufl.dx
+        - 0.1 * ufl.inner(ufl.cross(u, B), ufl.curl(C)) * ufl.dx
+        + ufl.inner((u - u_old) / dt, v) * ufl.dx
+        + ufl.inner(ufl.dot(ufl.grad(u), u), v) * ufl.dx
+        + nu * grad_u_norm**(p_value - 2.0) * ufl.inner(grad_u, ufl.grad(v)) * ufl.dx
+        + 0.1 * ufl.inner(ufl.cross(B, ufl.curl(B)), v) * ufl.dx
+        + q * ufl.div(u) * ufl.dx
+        - p * ufl.div(v) * ufl.dx
+    )
+
+    F_exact = (
+        ufl.inner(B_t_exact, C) * ufl.dx
+        + ufl.inner(ufl.curl(B_exact), ufl.curl(C)) * ufl.dx
+        - 0.1 * ufl.inner(ufl.cross(u_exact, B_exact), ufl.curl(C)) * ufl.dx
+        + ufl.inner(u_t_exact, v) * ufl.dx
+        + ufl.inner(ufl.dot(ufl.grad(u_exact), u_exact), v) * ufl.dx
+        + nu * grad_exact_norm**(p_value - 2.0) * ufl.inner(grad_exact, ufl.grad(v)) * ufl.dx
+
+        + 0.1 * ufl.inner(ufl.cross(B_exact, ufl.curl(B_exact)), v) * ufl.dx
+        + q * ufl.div(u_exact) * ufl.dx
+        - p_exact * ufl.div(v) * ufl.dx
+    )
+
+    residual = F_current - F_exact
+
+    fdim = domain.topology.dim - 1
+    boundary_facets = mesh.locate_entities_boundary(
+        domain,
+        fdim,
+        lambda x: np.full(x.shape[1], True, dtype=bool),
+    )
+
+    B_space, _ = W.sub(0).collapse()
+    B_boundary = fem.Function(B_space)
+    B_boundary.interpolate(exact_vec_numpy(0.0))
+
+    B_dofs = fem.locate_dofs_topological(
+        (W.sub(0), B_space),
+        fdim,
+        boundary_facets,
+    )
+
+    bc_B = fem.dirichletbc(B_boundary, B_dofs, W.sub(0))
+
+    u_space, _ = W.sub(1).collapse()
+    u_boundary = fem.Function(u_space)
+    u_boundary.interpolate(exact_vec_numpy(0.0))
+
+    u_dofs = fem.locate_dofs_topological(
+        (W.sub(1), u_space),
+        fdim,
+        boundary_facets,
+    )
+
+    bc_u = fem.dirichletbc(u_boundary, u_dofs, W.sub(1))
+
+    Q0, _ = W.sub(2).collapse()
+    p_zero = fem.Function(Q0)
+    p_zero.x.array[:] = 0.0
+
+    pressure_dofs = fem.locate_dofs_geometrical(
+        (W.sub(2), Q0),
+        lambda x: np.logical_and.reduce((
+            np.isclose(x[0], 0.0),
+            np.isclose(x[1], 0.0),
+            np.isclose(x[2], 0.0),
+        )),
+    )
+
+    bc_p = fem.dirichletbc(p_zero, pressure_dofs, W.sub(2))
+
+    problem = NonlinearProblem(
+        residual,
+        w,
+        bcs=[bc_B, bc_u, bc_p],
+        petsc_options_prefix=f"mhd_space_time_{n}_",
+        petsc_options={
+            "snes_type": "newtonls",
+            "snes_linesearch_type": "bt",
+            "snes_rtol": 1.0e-8,
+            "snes_atol": 1.0e-8,
+            "snes_max_it": 30,
+            "ksp_type": "preonly",
+            "pc_type": "lu",
+            "pc_factor_shift_type": "nonzero",
+            "pc_factor_shift_amount": 1.0e-10,
+            "snes_error_if_not_converged": False,
+            "ksp_error_if_not_converged": True,
+        },
+    )
+
+    n_steps = int(round(T / dt_value))
+    dt_value = T / n_steps
+    dt.value = dt_value
+    dx_error = ufl.Measure("dx", domain=domain, metadata={"quadrature_degree": 10})
+    rho = 1.0
+    mu = 1.0
+    sigma = 1.0
+    nu_value = 1.0
+
+
+    w.sub(0).interpolate(exact_vec_numpy(0.0))
+    w.sub(1).interpolate(exact_vec_numpy(0.0))
+    w.sub(2).interpolate(zero_pressure_numpy(0.0))
+    w_old.x.array[:] = w.x.array[:]
+
+    time.value = 0.0
+    time_u_grad_Lp_p = 0.0
+    time_B_curl_L2_sq = 0.0
+    for step in range(n_steps):
+        time.value = (step + 1) * dt_value
+
+        B_boundary.interpolate(exact_vec_numpy(float(time.value)))
+        u_boundary.interpolate(exact_vec_numpy(float(time.value)))
+
+        w.x.array[:] = w_old.x.array[:]
+
+        problem.solve()
+        Bh, uh, ph = w.split()
+        e_B = Bh - B_exact
+        e_u = uh - u_exact
+        e_p = ph - p_exact
+        grad_e_u = ufl.grad(e_u)
+        grad_e_u_norm = ufl.inner(grad_e_u, grad_e_u)
+        B_curl_L2_sq_form = fem.form(ufl.inner(ufl.curl(e_B), ufl.curl(e_B)) * dx_error)
+
+        u_grad_Lp_p_form = fem.form( ufl.inner((ufl.inner(grad_e_u, grad_e_u))**((p_value - 2)/2) * grad_e_u, grad_e_u) * dx_error)
+
+
+
+        B_curl_L2_sq_step = domain.comm.allreduce(
+            fem.assemble_scalar(B_curl_L2_sq_form), op=MPI.SUM
+        )
+
+        u_grad_Lp_p_step = domain.comm.allreduce(
+            fem.assemble_scalar(u_grad_Lp_p_form), op=MPI.SUM
+        )
+
+
+        time_u_grad_Lp_p += float(dt.value) * (nu_value / rho) * u_grad_Lp_p_step
+
+        time_B_curl_L2_sq += (
+            float(dt.value)
+            * (1.0 / (mu**2 * rho * sigma))
+            * B_curl_L2_sq_step
+        )
+        w_old.x.array[:] = w.x.array[:]
+
+    # AFTER loop: final-time L2 terms
+    Bh, uh, ph = w.split()
+    e_B = Bh - B_exact
+    e_u = uh - u_exact
+    e_p = ph - p_exact
+    u_L2_final_sq = domain.comm.allreduce(
+        fem.assemble_scalar(fem.form(ufl.inner(e_u, e_u) * dx_error)),
+        op=MPI.SUM,
+    )
+
+    B_L2_final_sq = domain.comm.allreduce(
+        fem.assemble_scalar(fem.form(ufl.inner(e_B, e_B) * dx_error)),
+        op=MPI.SUM,
+    )
+
+    p_L2_final_sq = domain.comm.allreduce(fem.assemble_scalar(fem.form(e_p * e_p * dx_error)), op=MPI.SUM)
+    u_L2_final = np.sqrt(u_L2_final_sq)
+    u_grad_time = time_u_grad_Lp_p**(1.00/p_value)
+
+
+    B_L2_final = np.sqrt((1.0 / (mu * rho)) * B_L2_final_sq)
+    B_curl_time = time_B_curl_L2_sq**(1.00/p_value)
+
+    p_L2_final = np.sqrt(p_L2_final_sq)
+
+    return (h,float(dt.value),B_L2_final,B_curl_time,u_L2_final,u_grad_time, p_L2_final,)
+
+cases = [
+    (2, 0.250000),
+    (4,  0.06250),
+    (8, 0.015625),
+
+]
+
+results = []
+
+for n_value, dt_value in cases:
+    print(f"Solving n = {n_value}, dt = {dt_value}")
+    results.append(solve_problem(n_value, dt_value))
+
+print("")
+print("Space-time convergence table")
+print("h          dt         B L2 error        B L2 rate        curl B error      curl B rate      u L2 error        u L2 rate        u grad error      u grad rate      p L2 error        p L2 rate")
+
+old = None
+
+for result in results:
+    h,dt_value, B_L2, B_curl, u_L2, u_grad, p_L2 = result
+
+    if old is None:
+        rates = ["-", "-", "-", "-", "-"]
+    else:
+        old_h, old_dt, old_B_L2, old_B_curl, old_u_L2, old_u_grad, old_p_L2 = old
+        rates = [
+            np.log(old_B_L2 / B_L2) / np.log(old_h / h),
+            np.log(old_B_curl / B_curl) / np.log(old_h / h),
+            np.log(old_u_L2 / u_L2) / np.log(old_h / h),
+            np.log(old_u_grad / u_grad) / np.log(old_h / h),
+            np.log(old_p_L2 / p_L2) / np.log(old_h / h),
+        ]
+
+
+    print(
+        f"{h:<10.5f} "
+        f"{dt_value:<10.5f} "
+
+        f"{B_L2:<17.6e} {rates[0]!s:<16} "
+        f"{B_curl:<17.6e} {rates[1]!s:<16} "
+        f"{u_L2:<17.6e} {rates[2]!s:<16} "
+        f"{u_grad:<17.6e} {rates[3]!s:<16} "
+        f"{p_L2:<17.6e} {rates[4]!s:<16}"
+    )
+
+    old = result
